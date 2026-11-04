@@ -1,10 +1,11 @@
-// This loads the variables from our .env file
-require("dotenv").config();
+const path = require("path");
+// This loads the variables from our .env file regardless of current working directory
+require("dotenv").config({ path: path.join(__dirname, ".env") });
 
 // Importing Express and required packages
 const express = require("express");
 const sgMail = require("@sendgrid/mail");
-const path = require("path");
+const fs = require("fs");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
@@ -20,7 +21,9 @@ const {
     doc,
     query,
     where,
-    updateDoc
+    updateDoc,
+    orderBy,
+    Timestamp
 } = require("firebase/firestore");
 
 // Creating our Express app
@@ -55,6 +58,16 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static(__dirname));
 
+// Also serve compiled frontend assets and images if available
+const distPath = path.join(__dirname, "../dist");
+if (fs.existsSync(distPath)) {
+    app.use(express.static(distPath));
+}
+const publicPath = path.join(__dirname, "../public");
+if (fs.existsSync(publicPath)) {
+    app.use(express.static(publicPath));
+}
+
 // Array to track email subscribers for newsletter
 const subscribers = [];
 
@@ -78,6 +91,26 @@ function authenticateToken(req, res, next) {
             });
         }
         req.user = user;
+        next();
+    });
+}
+
+// Helper: Optional JWT verification — attaches user if token is present, but doesn't require it
+function optionalAuth(req, res, next) {
+    const authHeader = req.headers["authorization"];
+    const token = authHeader && authHeader.split(" ")[1];
+
+    if (!token) {
+        req.user = null;
+        return next();
+    }
+
+    jwt.verify(token, JWT_SECRET, (err, user) => {
+        if (err) {
+            req.user = null;
+        } else {
+            req.user = user;
+        }
         next();
     });
 }
@@ -111,9 +144,21 @@ function isValidExpiry(expiry) {
     return true;
 }
 
-// Home page
-app.get("/", (req, res) => {
-    res.sendFile(path.join(__dirname, "index.html"));
+// Home page and client-side routes fallback
+app.get(["/", "/browse", "/post", "/pricing", "/login", "/signup"], (req, res) => {
+    const distIndex = path.join(__dirname, "../dist", "index.html");
+    if (fs.existsSync(distIndex)) {
+        return res.sendFile(distIndex);
+    }
+    const backendIndex = path.join(__dirname, "index.html");
+    if (fs.existsSync(backendIndex)) {
+        return res.sendFile(backendIndex);
+    }
+    const rootIndex = path.join(__dirname, "..", "index.html");
+    if (fs.existsSync(rootIndex)) {
+        return res.sendFile(rootIndex);
+    }
+    res.status(200).send("DEV@Deakin Backend Server running. Access frontend at http://localhost:5173");
 });
 
 // ----------------------------------------------------
@@ -415,6 +460,260 @@ app.post("/api/upgrade-plan", authenticateToken, async (req, res) => {
         return res.status(500).json({
             success: false,
             message: "Failed to process upgrade. Please try again."
+        });
+    }
+});
+
+// ----------------------------------------------------
+// 5. POST CREATION ENDPOINT (Task D2)
+// ----------------------------------------------------
+// SECURITY: Only authenticated users can create posts.
+// The backend verifies the JWT, derives the user ID from the token,
+// retrieves the user's plan from Firestore (never trusts frontend data),
+// and performs full server-side validation before saving.
+app.post("/api/posts", authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+
+        // 1. Retrieve authenticated user's data from Firestore to get trusted plan info
+        const userRef = doc(db, "users", userId);
+        const userSnap = await getDoc(userRef);
+
+        if (!userSnap.exists()) {
+            return res.status(404).json({
+                success: false,
+                message: "User account not found. Cannot create post."
+            });
+        }
+
+        const userData = userSnap.data();
+
+        // 2. Extract and validate post data from the request body
+        const { type, plan, title, abstract, content, description, tags } = req.body;
+
+        // -- Validate post type --
+        if (!type || !["article", "question"].includes(type)) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid post type. Must be 'article' or 'question'."
+            });
+        }
+
+        // -- Validate post plan --
+        if (!plan || !["free", "paid"].includes(plan)) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid post plan. Must be 'free' or 'paid'."
+            });
+        }
+
+        // -- Validate title (required for both types) --
+        if (!title || typeof title !== "string" || title.trim().length === 0) {
+            return res.status(400).json({
+                success: false,
+                message: "Title is required and cannot be empty or whitespace-only."
+            });
+        }
+        if (title.trim().length > 150) {
+            return res.status(400).json({
+                success: false,
+                message: "Title must be 150 characters or fewer."
+            });
+        }
+
+        // -- Validate tags (required, max 3, no empty/whitespace tags) --
+        if (!tags || !Array.isArray(tags) || tags.length === 0) {
+            return res.status(400).json({
+                success: false,
+                message: "At least one tag is required."
+            });
+        }
+        if (tags.length > 3) {
+            return res.status(400).json({
+                success: false,
+                message: "A maximum of 3 tags is allowed."
+            });
+        }
+        // Validate each tag is non-empty
+        const cleanedTags = tags.map(t => (typeof t === "string" ? t.trim() : "")).filter(t => t.length > 0);
+        if (cleanedTags.length === 0) {
+            return res.status(400).json({
+                success: false,
+                message: "Tags cannot be empty or whitespace-only."
+            });
+        }
+
+        // -- Type-specific validation --
+        if (type === "article") {
+            // Abstract is required for articles
+            if (!abstract || typeof abstract !== "string" || abstract.trim().length === 0) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Abstract is required for articles and cannot be empty."
+                });
+            }
+            if (abstract.trim().length > 500) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Abstract must be 500 characters or fewer."
+                });
+            }
+
+            // Content (article text) is required for articles
+            if (!content || typeof content !== "string" || content.trim().length === 0) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Article content is required and cannot be empty."
+                });
+            }
+            if (content.trim().length > 10000) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Article content must be 10000 characters or fewer."
+                });
+            }
+        } else if (type === "question") {
+            // Description is required for questions
+            if (!description || typeof description !== "string" || description.trim().length === 0) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Question description is required and cannot be empty."
+                });
+            }
+            if (description.trim().length > 5000) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Question description must be 5000 characters or fewer."
+                });
+            }
+        }
+
+        // 3. Build the post document for Firestore
+        // SECURITY: userId is derived from the verified JWT, not from frontend data.
+        // The authorName is derived from the trusted Firestore user record.
+        const postDoc = {
+            title: title.trim(),
+            type,
+            plan,
+            tags: cleanedTags,
+            userId,
+            authorName: userData.name || "Anonymous",
+            authorEmail: userData.email || null,
+            createdAt: new Date().toISOString()
+        };
+
+        // Add type-specific fields
+        if (type === "article") {
+            postDoc.abstract = abstract.trim();
+            postDoc.content = content.trim();
+        } else if (type === "question") {
+            postDoc.description = description.trim();
+        }
+
+        // 4. Save to Firestore 'posts' collection
+        const postsRef = collection(db, "posts");
+        const docRef = await addDoc(postsRef, postDoc);
+
+        console.log(`Post created: ${docRef.id} by user ${userId} (${type}, ${plan})`);
+
+        return res.status(201).json({
+            success: true,
+            message: "Post created successfully!",
+            postId: docRef.id
+        });
+
+    } catch (error) {
+        console.error("Post creation error:", error);
+        return res.status(500).json({
+            success: false,
+            message: "Server error while creating post. Please try again."
+        });
+    }
+});
+
+// ----------------------------------------------------
+// 6. GET POSTS ENDPOINT (Task D2 - Browse Posts)
+// ----------------------------------------------------
+// SECURITY: This endpoint determines which posts the user is authorised to see.
+// - Visitors (no token) and Free users: only receive posts with plan === "free"
+// - Paid users: receive all posts (both "free" and "paid")
+// The backend NEVER sends paid posts to unauthorised users.
+// The user's subscription status is verified from Firestore, not from the JWT or frontend.
+app.get("/api/posts", optionalAuth, async (req, res) => {
+    try {
+        let userPlan = "Free"; // Default: treat as Free/visitor
+
+        // If user is authenticated, look up their ACTUAL plan from Firestore
+        // SECURITY: We do NOT trust the plan field in the JWT.
+        // We always read the latest plan from Firestore to prevent manipulation.
+        if (req.user && req.user.id) {
+            try {
+                const userRef = doc(db, "users", req.user.id);
+                const userSnap = await getDoc(userRef);
+                if (userSnap.exists()) {
+                    userPlan = userSnap.data().plan || "Free";
+                }
+            } catch (lookupErr) {
+                console.warn("Could not verify user plan, defaulting to Free:", lookupErr.message);
+            }
+        }
+
+        // Fetch posts from Firestore
+        const postsRef = collection(db, "posts");
+        const postsSnapshot = await getDocs(postsRef);
+
+        const posts = [];
+        postsSnapshot.forEach((docSnap) => {
+            const data = docSnap.data();
+            const postPlan = (data.plan || "free").toLowerCase();
+
+            // SECURITY: Only include paid posts if the user has a Paid subscription
+            // For Free users and visitors, paid posts are NEVER included in the response
+            if (postPlan === "paid" && userPlan !== "Paid") {
+                return; // Skip this paid post — user is not authorised
+            }
+
+            // Normalise createdAt to an ISO string regardless of source format
+            let createdAt = data.createdAt || data.createdAtString || null;
+            if (createdAt && typeof createdAt === "object" && createdAt.seconds) {
+                // Firestore Timestamp object — convert to ISO string
+                createdAt = new Date(createdAt.seconds * 1000).toISOString();
+            }
+
+            posts.push({
+                id: docSnap.id,
+                title: data.title || "",
+                type: data.type || data.postType || "question",
+                plan: postPlan,
+                tags: data.tags || [],
+                abstract: data.abstract || "",
+                content: data.content || data.articleText || "",
+                description: data.description || "",
+                authorName: data.authorName || data.author?.name || "Anonymous",
+                userId: data.userId || data.author?.id || null,
+                createdAt
+            });
+        });
+
+        // Sort posts by creation date (newest first)
+        posts.sort((a, b) => {
+            const dateA = a.createdAt ? new Date(a.createdAt) : new Date(0);
+            const dateB = b.createdAt ? new Date(b.createdAt) : new Date(0);
+            return dateB - dateA;
+        });
+
+        return res.status(200).json({
+            success: true,
+            count: posts.length,
+            userPlan,
+            posts
+        });
+
+    } catch (error) {
+        console.error("Fetch posts error:", error);
+        return res.status(500).json({
+            success: false,
+            message: "Failed to retrieve posts. Please try again."
         });
     }
 });
